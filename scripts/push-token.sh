@@ -49,10 +49,12 @@ if ! git remote | grep -qx upstream; then
 fi
 echo "[2/4] remote:"; git remote -v | sed 's/^/      /'
 
-# 3. 推送（令牌只在这一次调用的 helper 里出现，不落盘）
+# 3. 推送（令牌只在这一次调用的 extraheader 里出现，不落盘）
+#    注意：git over HTTPS 只认 Basic，Bearer 会被 403；用户名段固定 x-access-token
 echo "[3/4] push main …"
-git -c credential.helper='' \
-    -c "http.https://github.com/.extraheader=Authorization: Bearer ${GH_TOKEN}" \
+BASIC=$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64)
+GIT_TERMINAL_PROMPT=0 git -c credential.helper='' \
+    -c "http.https://github.com/.extraheader=Authorization: Basic ${BASIC}" \
     push origin main:main
 
 # 4. 收尾
