@@ -220,9 +220,23 @@ const SAFE_PREFIXES = [
 
 // 无害模型侧工具：ask_user_question 用于把问题转给管理员/用户，
 // todo_write 仅维护任务列表。若后续 preset 不再挂载这些工具，保留无害。
+// 短名放行：preset / 唤醒提示里写的是 `qq_send_message`，而 DSH 实际注册名是
+// `mcp__snowluma__qq_send_message`。模型两种写法都会用（实测同一会话里 4 次全名 + 8 次短名），
+// 只认前缀会把短名全部当成「不在白名单」拒掉 —— 2026-10-28 18:56 整轮对话因此发不出任何消息。
+// 这里只放行我们自己那两个 MCP 命名空间的短名，别的一概不放：
+// 即使模型编出一个不存在的 qq_xxx，执行时也会因为「没有这个工具」失败，不会造成越权。
+const SAFE_SHORT_NAME = /^(qq_[a-z0-9_]+|snowluma_[a-z0-9_]+|web_search|web_fetch)$/;
+
 const SAFE_EXACT = new Set([
   'ask_user_question',
   'todo_write',
+  // Hindsight 记忆（替代 qq_memory_* 的跨会话记忆）：只放行「检索 / 读 / 反思 / 写入」四个动作。
+  // capture_initiative / diagnose / sync_status 是开发期工具，QQ 会话不需要，故意不给。
+  'hindsight_search_knowledge_pages',
+  'hindsight_list_knowledge_pages',
+  'hindsight_read_knowledge_page',
+  'hindsight_reflect',
+  'hindsight_ingest_document',
 ])
 
 // ── 诊断落盘：restrict 失败时到底为什么 ────────────────────────────────────
@@ -323,6 +337,7 @@ export function apply(ctx) {
     if (typeof name !== 'string' || name.length === 0) return '工具名无效，已拒绝'
     if (SAFE_EXACT.has(name)) return
     if (SAFE_PREFIXES.some((prefix) => name.startsWith(prefix))) return
+    if (SAFE_SHORT_NAME.test(name)) return
     return `工具 "${name}" 不在 QQ 桥接白名单内，已拒绝（仅允许 QQ MCP 工具与无害模型侧工具）`
   })
 }

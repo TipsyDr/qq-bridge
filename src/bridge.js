@@ -515,6 +515,8 @@ const DIRECTION_HINT = '注意：消息里的 [引用 某人：...] 表示这句
 
 // 已知的二代 agent token 集合：日志/活动/出站文本统一脱敏，防止令牌被模型泄露到 QQ。
 const KNOWN_AGENT_TOKENS = new Set();
+/** AI 请求唤醒他人时的频控记录：key -> 最近唤醒时间戳数组。 */
+const agentWakeLog = new Map();
 
 // 会话 → 该会话「当前代 + 上一代」agentToken 的索引（见 rememberAgentToken）。
 //
@@ -2760,6 +2762,19 @@ async function main() {
   }
 
   function retireSession(key) {
+    // 会话退役时把已读水位推到最新：旧会话已经结束，那些消息不该在新的 bootstrap 里
+    // 重新长成「未读」。不推的话，每次唤醒都会把已经回过的历史整段重发（实测一次 7 条 ~1200 字）。
+    try {
+      const v2st = socialV2.conversations.get(key);
+      if (v2st) {
+        const unreadSeq = Number(v2st.lastUnreadSeq) || 0;
+        const readSeq = Number(v2st.lastReadThroughSeq) || 0;
+        if (unreadSeq > readSeq) {
+          v2st.lastReadThroughSeq = unreadSeq;
+          log(`[recycle] ${key} 会话退役：已读水位 ${readSeq} → ${unreadSeq}`);
+        }
+      }
+    } catch (error) { log(`⚠️ 退役时推进水位失败 ${key}：${error?.message ?? error}`); }
     const sessionId = state.sessions[key];
     delete state.sessions[key];
     delete state.sessionPolicies[key];
@@ -2946,6 +2961,33 @@ async function main() {
     dshCheckStarted = true;
     checkDsh();
     setInterval(checkDsh, 5000);
+
+    // ── 闲置会话回收（所有模式生效，不受一代仿真状态机限制）──────────────────
+    // 为什么需要：QQ 侧冷场后桥不会主动退役会话，DSH 侧上下文只增不减，涨到窗口上限
+    // 就触发 compaction —— compaction 要把全量上下文重算一遍（实测一次 30~50 万 tokens），
+    // 那是账单的主要来源。冷场即退役，下次唤醒重建会话（bootstrap），长期记忆交给 Hindsight。
+    // 阈值 socialV2.sessionRecycleIdleMs，0 = 关闭（默认关闭，行为与上游一致）。
+    function recycleIdleSessions() {
+      const idleMs = Number(cfg.socialV2?.sessionRecycleIdleMs ?? 0);
+      if (!(idleMs > 0)) return;
+      const nowMs = Date.now();
+      for (const [key, sid] of Object.entries(state.sessions ?? {})) {
+        if (!sid) continue;
+        const v2 = socialV2.conversations.get(key);
+        const lastActivity = Math.max(
+          Number(v2?.lastIncomingAt) || 0,
+          Number(v2?.lastAiReplyAt) || 0,
+          Number(social.states.get(key)?.lastActiveMessageAt) || 0,
+        );
+        if (!lastActivity || nowMs - lastActivity < idleMs) continue;
+        log(`[recycle] ${key} 闲置 ${Math.round((nowMs - lastActivity) / 60000)} 分钟 → 退役会话（下次唤醒重建，记忆留在 Hindsight）`);
+        retireSession(key);
+      }
+    }
+    setInterval(recycleIdleSessions, 60_000);
+    // 好友备注：启动后 3 秒拉一次，之后每 10 分钟刷新（备注改名后能跟上）
+    setTimeout(() => { void refreshFriendLabels(); }, 3000);
+    setInterval(() => { void refreshFriendLabels(); }, 10 * 60_000);
   }
 
   // ── SnowLuma 上游健康：**连上了 ≠ 收得到** ──────────────────────────────────
@@ -3358,7 +3400,9 @@ async function main() {
         // 管理端专用 v2 接口：带 agent token 的请求一律拒绝，防止 MCP 工具越权访问控制台功能
         // /api/socialV2/initial-prompt 也在这里：它是操作者写给 AI 的"环境背景"，
         // 让 AI 自己读/改等于把控制台的管理输入（以及未来可能写入的其它群信息）交给会话主体。
-        const adminOnlyV2Paths = ['/api/socialV2/config', '/api/socialV2/activity', '/api/socialV2/reset', '/api/socialV2/states', '/api/socialV2/wake', '/api/socialV2/initial-prompt'];
+        // 注意：/api/socialV2/wake 不在这里 —— AI 需要能「请求唤醒另一个会话」（比如老板让它去陪某人聊天），
+// 但要走下面的 agent 专用校验（token 必须有效 + 目标在白名单 + 每个目标每分钟最多 2 次）。
+const adminOnlyV2Paths = ['/api/socialV2/config', '/api/socialV2/activity', '/api/socialV2/reset', '/api/socialV2/states', '/api/socialV2/initial-prompt'];
         if (req.headers['x-agent-token'] && (adminOnlyV2Paths.includes(url.pathname) || (url.pathname === '/api/socialV2/feedback' && req.method === 'GET') || (url.pathname === '/api/socialV2/tool-log' && req.method === 'GET'))) {
           sendJson({ ok: false, error: '该接口仅控制台可用' }, 403);
           return;
@@ -4995,6 +5039,21 @@ async function main() {
           if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
             sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
             return;
+          }
+          // AI 主动请求唤醒他人：token 必须有效，且每个目标每分钟最多 2 次
+          // （防它反复催同一个人 → 连着发消息 → 触发 QQ 风控）。
+          const agentWakeToken = req.headers['x-agent-token'];
+          if (agentWakeToken) {
+            if (!KNOWN_AGENT_TOKENS.has(agentWakeToken)) { sendJson({ ok: false, error: '令牌无效' }, 403); return; }
+            const nowWake = Date.now();
+            const recent = (agentWakeLog.get(key) ?? []).filter((t) => nowWake - t < 60000);
+            if (recent.length >= 2) {
+              sendJson({ ok: false, error: `对 ${key} 的主动唤醒太频繁（每分钟最多 2 次），等一会儿再试` }, 429);
+              return;
+            }
+            recent.push(nowWake);
+            agentWakeLog.set(key, recent);
+            log(`[wake-peer] AI 请求唤醒 ${key}（${recent.length}/2 次每分钟）`);
           }
           const st = getSocialV2State(key);
           if (st.pendingWakeTimer) {
@@ -9149,6 +9208,15 @@ async function main() {
       wakeState = getSocialV2State(key);
       wakeToken = wakeState.agentToken;
       promptText = buildWakePromptV2(key, opts.wakeReason);
+      // 记忆预取：放在令牌/人设之后、快照之前 —— 先让模型知道“这人是老熟人”，再看新消息。
+      const memoryHint = await recallPeerMemory(key, opts.wakeReason);
+      if (memoryHint) {
+        promptText = promptText.replace(
+          '\n\n【首回复节奏】',
+          `\n\n【你记得（Hindsight）】\n${memoryHint}\n\n【首回复节奏】`,
+        );
+        log(`[memory] ${key} 预取到 ${memoryHint.split('\n').length} 条记忆`);
+      }
       wakeSnapshot = buildWakeSnapshotV2(key);
       if (wakeSnapshot) {
         promptText += `\n\n【本次消息快照】\n${JSON.stringify(wakeSnapshot)}\n以上消息已提供，无需重复查询；partial=true 时用 qq_get_unread_messages(afterSeq=readThroughSeq) 继续读取。先处理当前消息；回复前如需确认后续补充，用 qq_wait_for_messages(purpose="reply") 补足短静默，已安静够久会立即返回，不要先长等。收尾只确认你已处理的 readThroughSeq（本地 seq，非 QQ messageId），传给 qq_mark_read 或 qq_set_wake_config 的 throughSeq；新到消息留待处理。`;
@@ -9249,6 +9317,7 @@ async function main() {
   function socialLoopTick() {
     if (!isSocialEnabled()) return;
     const now = Date.now();
+
     // 所有"发过消息或已有状态"的群都参与状态机（观望中的群也做主动判定）
     const keys = new Set([...social.states.keys(), ...social.recentMessages.keys()]);
     for (const key of keys) {
@@ -10195,16 +10264,11 @@ async function main() {
     const ageMin = Math.max(0, Math.floor((now - Number(newest.time)) / 60000));
     const staleNow = ageMin >= chatMin;
     const tooOld = ageMin >= silentMin;
+    // 判定规则（三档阈值）已移入 preset 的【时间感】，这里只留本次唤醒的实测数据，
+    // 避免同一套规则在 system prompt 与 user message 里各发一遍。
     const lines = [
-      `【时间感：先看消息多旧，再决定怎么开口】现在 ${localClockText(now)}；最新一条来自「${sender}」，是 ${ageText} 之前发的（${localClockText(newest.time)}）。`,
-      '- 消息里的 at 是本地时间、ago 是距现在多久；开口前先确认最新那条的 ago，不要凭感觉当成"刚刚"。',
-      `- ${chatMin} 分钟以内：正常接，当实时对话。`
+      `【时间感】现在 ${localClockText(now)}；最新一条来自「${sender}」，是 ${ageText} 之前发的（${localClockText(newest.time)}）。判定规则见人设【时间感】。`
     ];
-    // 中间档只在两档阈值真的分开时才写：silentMin === chatMin 时写「60～60 分钟」是自相矛盾的废话。
-    if (silentMin > chatMin) {
-      lines.push(`- ${chatMin}～${silentMin} 分钟：可以接，但别用"刚""哈哈哈刚看到"这类实时语气；先确认这个话题还在不在、对方还在不在。`);
-    }
-    lines.push(`- 超过 ${silentMin} 分钟：默认不回，直接 qq_mark_read 收尾；只有当那条明确是找你/提问你、而且回答现在仍然有用时才回，并且开头要带时间感（"这条我才看到""过了挺久才看到"）。`);
     if (staleNow) {
       lines.push(`⚠️ 本次属于「旧账」：最新消息已经是 ${ageText} 前，${tooOld ? `超过 ${silentMin} 分钟` : `超过 ${chatMin} 分钟`}。不要用秒回语气，也不要把别人的旧话题当现在的事接。`);
     }
@@ -10290,6 +10354,117 @@ async function main() {
     return `【你的身份】你在 QQ 上的昵称是${label}${idText}。${callBits}；群名片可能与昵称不同，at/引用段里带${id ? ` ${id} ` : '你的 QQ 号'}就是在叫你。\n\n`;
   }
 
+  // ── Hindsight 记忆预取 ─────────────────────────────────────────────────
+  // 为什么桥要自己做：Hindsight 的**写入**是后台自动抽取的（不用 AI 调工具），
+  // 但**读取**必须有人发起。以前只能指望 AI 自己想起来调 hindsight_*，实测它从不主动调
+  // （尤其会话刚被回收、走 bootstrap 时，它没有任何上下文提示它去搜）。
+  // 所以唤醒前用对方最近说的话做 query 检索一次，把结果直接拼进提示。
+  // 失败一律静默降级（记忆是增强，不是唤醒的前置条件）。
+  // ── 好友备注（让 AI 用「爸爸」「妈妈」称呼，而不是一串 QQ 号）──
+  // 备注是用户自己设的，比昵称（"ゞ Водка"/"BEI"）更接近真实关系。
+  // 同步读缓存：唤醒提示是同步构造的，所以数据靠后台定时刷新。
+  const friendLabelCache = { at: 0, map: new Map() };
+  function friendLabelOf(id) { return friendLabelCache.map.get(String(id)) || ''; }
+  async function refreshFriendLabels() {
+    try {
+      const body = await onebotHttpAction('get_friend_list', {}, { timeoutMs: 8000 });
+      const rows = Array.isArray(body?.data) ? body.data : (Array.isArray(body) ? body : []);
+      const map = new Map();
+      for (const f of rows) {
+        const id = String(f?.user_id ?? '');
+        if (!id) continue;
+        const label = String(f?.remark || '').trim() || String(f?.nickname || '').trim();
+        if (label) map.set(id, label);
+      }
+      friendLabelCache.map = map;
+      friendLabelCache.at = Date.now();
+      if (map.size) log(`[remark] 已载入 ${map.size} 个好友备注（${[...map.entries()].filter(([, v]) => v).slice(0, 4).map(([k, v]) => `${k}=${v}`).join(' ')}…）`);
+    } catch (error) {
+      friendLabelCache.at = Date.now();
+      log(`[remark] 好友列表获取失败（用 QQ 号代替）：${error?.message ?? error}`);
+    }
+  }
+
+  const recallCache = new Map(); // key -> { text, query, at }
+  async function recallPeerMemory(key, reason) {
+    const hs = cfg.socialV2?.hindsight ?? {};
+    if (hs.enabled === false) return '';
+    const st = socialV2.conversations.get(key);
+    const picked = [...(Array.isArray(st?.unread) ? st.unread : []), ...(Array.isArray(st?.recentMessages) ? st.recentMessages : [])]
+      .filter((m) => m && !m.isSelf)
+      .slice(-3)
+      .map((m) => String(m.text || m.plain || '').replace(/\[图片\]|\[表情\]/g, '').trim())
+      .filter(Boolean);
+    const who = String(key).replace(/^(private|group):/, '');
+    const query = [who, ...picked].join(' ').slice(0, 200) || String(reason || '聊过什么');
+    const cached = recallCache.get(key);
+    if (cached && cached.query === query && Date.now() - cached.at < 5 * 60 * 1000) return cached.text;
+    const bankId = String(hs.bankId || 'coding-agent::qq-workspace');
+    const url = `http://127.0.0.1:${Number(hs.port) || 9077}/v1/default/banks/${encodeURIComponent(bankId)}/memories/recall`;
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ query, max_tokens: Number(hs.maxTokens) || 400 }),
+        signal: AbortSignal.timeout(Number(hs.timeoutMs) || 4000),
+      });
+      if (!response.ok) { recallCache.set(key, { text: '', query, at: Date.now() }); return ''; }
+      const body = await response.json();
+      // 过滤「被自动抽取的 prompt 噪声」：Hindsight 的 retain 会把唤醒提示里的
+      // 【会话令牌】【二代仿真模式说明】也抽成事实，实测召回前 3 条里 2 条是这种垃圾，
+      // 其中一条还带明文令牌。这类条目既没用又危险，注入前一律剔除。
+      const MEMORY_NOISE = /会话令牌|状态令牌|调用二代|状态工具|\btoken\b|ownerQQ|二代仿真模式|文本输出不会自动发送|所有发言都必须|系统提示|system prompt|[0-9a-f]{32,}/i;
+      // 主语标注：记忆库是「大肥鱼」自己的（不分库），但每条要标清讲的是谁，
+      // 当前对话对象排前面 —— 这样它不会把别人的事当成眼前这个人的上下文。
+      const currentId = String(key).replace(/^(private|group):/, '');
+      // 顺手删除：召回是唯一能「看到具体是哪条记忆」的时机，所以噪声条目在这里删掉，
+      // 而不是靠定时器全量扫。Hindsight 的 retain 没有入库前钩子（env 与插件配置都没有
+      // 内容过滤项，只能整体开关），所以「写后清理」是唯一可行的位置。
+      const purged = [];
+      const scored = (Array.isArray(body?.results) ? body.results : [])
+        .map((r) => {
+          const text = String(r?.text || '').trim();
+          if (text.length < 8 || MEMORY_NOISE.test(text)) {
+            if (r?.id && MEMORY_NOISE.test(text)) purged.push(String(r.id));
+            return null;
+          }
+          const ids = [...new Set((text.match(/\d{6,12}/g) || []))];
+          const otherId = ids.find((id) => id !== currentId);
+          const tag = ids.includes(currentId)
+            ? (friendLabelOf(currentId) || '当前对话对象')
+            : (otherId ? (friendLabelOf(otherId) || `QQ ${otherId}`) : '');
+          return { text, tag, rank: ids.includes(currentId) ? 0 : (ids.length ? 1 : 2) };
+        })
+        .filter(Boolean)
+        .sort((a, b2) => a.rank - b2.rank)
+        .slice(0, Number(hs.maxItems) || 3);
+      // 正则只能判断「提到过某人」，判断不了「这条的主语是谁」（"管理员把 B 的号托付给我"
+      // 这条讲的是管理员，但文本里有 B 的号）。所以除了前缀标签，再给一句全局提示，
+      // 让模型自己按原文主语判断 —— 宁可多说一句，也不要它把别人的事当成眼前这个人的。
+      const text = scored.length === 0 ? '' : [
+        `（当前对话对象：${friendLabelOf(currentId) ? `${friendLabelOf(currentId)}（${key}）` : key}。以下都是「你」记得的事，但主体不一定是你眼前这个人，按原文主语区分。）`,
+        ...scored.map((item) => `- ${item.tag ? `[${item.tag}] ` : ''}${item.text.length > 220 ? `${item.text.slice(0, 220)}…` : item.text}`),
+      ].join('\n');
+      recallCache.set(key, { text, query, at: Date.now() });
+      if (purged.length) {
+        void (async () => {
+          for (const id of purged) {
+            try {
+              await fetch(`${url.replace(/\/memories\/recall$/, '')}/memories/${encodeURIComponent(id)}`, {
+                method: 'DELETE', signal: AbortSignal.timeout(4000),
+              });
+            } catch { /* 删不掉就算了，下次召回还会再试 */ }
+          }
+          log(`[memory] 顺手清掉 ${purged.length} 条噪声记忆（令牌/模式说明）`);
+        })();
+      }
+      return text;
+    } catch (error) {
+      recallCache.set(key, { text: '', query, at: Date.now() });
+      return '';
+    }
+  }
+
   function buildWakePromptV2(key, reason) {
     const roleState = readRoleState();
     const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
@@ -10302,16 +10477,18 @@ async function main() {
     // 避免唤醒 prompt 出现两份黑话表。
     const participationText = formatParticipationV2(st);
     const participationLine = participationText ? `${participationText}\n\n` : '';
-    const antiAiLine = '【反AI味】你不是客服：不用有求必应，可以装傻、已读乱回、拒绝推荐；少用“一绝/真管用/保证/绝对”这类词。\n\n';
+    // 【反AI味】规则已在 preset（system prompt）里，这里不再重复发一遍（省每轮 cacheMiss）。
+    const antiAiLine = '';
     const stickerCfg = cfg.socialV2?.sticker ?? {};
     const stickerLine = stickerCfg.enabled !== false && stickerCfg.includeInPrompt !== false
       ? `${buildStickerStrategyHint()}\n${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 8)}\n\n`
       : '';
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
-    const proactiveLine = '【积极性】不要习惯性潜水：群里有你能接的话题就主动参与，偶尔插一句别人的话题也很正常；只有确实没话可说、对方已明确结束、或长时间没人说话时才潜水。\n\n';
+    // 【积极性】同上：preset 的「该说/不该说」「不要习惯性潜水」已覆盖，桥里不再重复。
+    const proactiveLine = '';
     const replyTiming = replyTimingV2(st);
-    const replyLine = `【首回复节奏】先处理已有消息，完整的问题及时回答。需要确认对方是否继续补充时，用 qq_wait_for_messages(purpose="reply", quietMs=${replyTiming.quietMs})；从最后来信计时，合批和读提示词的耗时也算，目前还差约 ${Math.ceil(replyTiming.remainingQuietMs / 1000)} 秒静默。已安静够久可直接回，工具也会立即返回并补上思考期间的新消息。只有明确没说完、你确实要等下文时，才用普通 messages 长等待。\n\n`;
-    const preSleepLine = `【沉睡前强制等待】这是决定潜水收尾时的步骤，不是首回复的前置条件。除非对方明确说“不聊了/晚安/下了/拜拜”等结束语，否则每次设置潜水/下一次唤醒前，必须先调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成一次沉睡前观察；回复前 purpose="reply" 的短静默不能代替这次完整观察。若 ${Math.round(preSleepMs / 60000)} 分钟内没人说话，返回 preSleepWaitSatisfied=true，可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看返回的 newMessages——判断不需要你参与就可以直接沉睡，若你选择参与回复，则下次想睡时需要重新等待观察窗口。【不要靠猜】：等待返回里的 canSleepNow/hint 就是闸门的判断结果——canSleepNow=true 立刻收尾（mark_read 或 set_wake_config）；false 时按 hint 给出的 timeoutMs 一次等满，别用更短的 timeoutMs 去凑（更短的等待不算观察，只会白等一轮）。\n\n`;
+    const replyLine = `【首回复节奏】要确认对方是否补充，用 qq_wait_for_messages(purpose="reply", quietMs=${replyTiming.quietMs})，还差约 ${Math.ceil(replyTiming.remainingQuietMs / 1000)} 秒静默即可回。\n\n`;
+    const preSleepLine = `【沉睡前强制等待】收尾前必须先 qq_wait_for_messages(timeoutMs=${preSleepMs}) 等满观察窗口；canSleepNow=true 才能收尾。\n\n`;
     const lastMsg = [...(Array.isArray(st.recentMessages) ? st.recentMessages : [])].reverse().find((m) => m && !m.isSelf);
     const lastAiMin = st.lastAiReplyAt ? Math.max(0, Math.round((Date.now() - Number(st.lastAiReplyAt)) / 60000)) : null;
     const statusBits = [`未读 ${(st.unread || []).length} 条`];
@@ -10350,7 +10527,7 @@ async function main() {
     const triggeredAgo = triggeredMsg ? describeAge(triggeredMsg.time, Date.now()) : '';
     const triggeredLine = triggeredAgo ? `（触发这条是 ${triggeredAgo} 前发的${triggeredMsg?.sender ? `，来自「${triggeredMsg.sender}」` : ''}，不是刚刚）` : '';
     if (reason === 'bootstrap') {
-      return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
+      return `${base}【引导唤醒】首次接入 ${key}，先调 qq_get_prompt 看角色与推荐值（规则见人设【首次接入】）。`;
     }
     if (reason === 'timeout') {
       return `${base}【唤醒】${key}\n原因：你设置的有限潜水时间已到；在你规定的时间内没有任何一项条件被触发，只是因为时间到了所以你被唤醒。\n你可以查看消息，或继续设置新的唤醒条件。`;
@@ -10364,7 +10541,7 @@ async function main() {
     if (reason === 'poke') {
       return `${base}【唤醒】${key}\n原因：有人拍了一拍（可能拍了你，也可能拍了别人）。\n先看未读/最近消息里的 [拍一拍] 事件：如果是拍你，可以自然回应一句，也可以用 qq_send_poke 回一个拍一拍；如果是拍别人，觉得有趣也可以接梗。除了回应，偶尔也可以主动戳一下正在聊的人/熟人，像真人手贱/提醒/逗一下，但别频繁。不想接就安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
     }
-    return `${base}【唤醒】${key}\n原因：${reason}${triggeredLine}\n【行动前】先判断：群里在聊什么？热闹还是冷清？有没有人直接找你？对方说完了吗？你有没有真正想说的？\n如果群聊正热但没人叫你，可以插一句有趣的/相关的，插不上再看情况潜水；不要一上来就划走。\n【引用：只在必要时用】只有你这条消息指向的人或消息并非最新一条别人的消息，或者你连续的几句话中不同消息指代的是不同的消息或人时，才用 qq_reply 或 qq_send_message 的 replyToMessageId 指向具体那条；其他情况不要引用，别让对方猜。\n你可以调用工具查看未读消息、人设、状态，自行决定是否发言；决定潜水前必须按上面的【沉睡前强制等待】先等够观察窗口。`;
+    return `${base}【唤醒】${key}${friendLabelOf(String(key).replace(/^(private|group):/, '')) ? `（${friendLabelOf(String(key).replace(/^(private|group):/, ''))}）` : ''}\n原因：${reason}${triggeredLine}`;
   }
 
   function buildWakeReminderPromptV2(key) {
@@ -11330,6 +11507,22 @@ async function main() {
       // 回合正常收尾：collector 立刻释放。v2TurnStartAt 留给调用方（无行动判定要用它），
       // 调用方在 `if (ended)` 分支里用完再删。
       collectors.delete(sessionId);
+      // ── 回合结束即推进已读水位（不依赖 AI 调 mark_read）──────────────
+      // 实测 preset 要求每轮收尾 qq_mark_read，但模型经常只回话不调工具，
+      // 于是「已经回过的消息」在下一轮唤醒又整段重发（16:33 那轮 7 条里 6 条是重复的）。
+      // 回合既然结束了，这批未读就算处理过 —— 由桥来记，别赌模型自觉。
+      try {
+        if (currentMode === 'reserved2') {
+          const doneKey = reverse.get(sessionId);
+          const doneState = doneKey ? socialV2.conversations.get(doneKey) : null;
+          const unreadSeq = Number(doneState?.lastUnreadSeq) || 0;
+          const readSeq = Number(doneState?.lastReadThroughSeq) || 0;
+          if (doneState && unreadSeq > readSeq) {
+            doneState.lastReadThroughSeq = unreadSeq;
+            log(`[watermark] ${doneKey} 回合结束，自动推进已读水位 ${readSeq} → ${unreadSeq}`);
+          }
+        }
+      } catch (error) { log(`⚠️ 自动推进水位失败：${error?.message ?? error}`); }
     } else if (event?.type === 'turn/end' && (!collector || collector.size?.() === 0)) {
       collectors.delete(sessionId);
       v2TurnStartAt.delete(sessionId);

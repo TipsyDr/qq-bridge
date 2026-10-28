@@ -345,6 +345,13 @@ const TOOL_CONFIG_FLAGS = {
   qq_get_self_image: 'getSelfImage',
   qq_sticker_note: 'stickerNote',
   qq_set_sticker_remark: 'setStickerRemark',
+  qq_wake_peer: 'wakePeer',
+  // 2026-10-28：与 qq_send_message 功能重复的三个入口补登记，便于按模式关闭省 token。
+  // 说明：group/private 两个入口原本服务 chat / reserved / closed-agent 多模式，
+  // 这里只是让「v2 的开关也能管到它们」，默认值仍是 true（不改变现有行为）。
+  qq_status: 'status',
+  qq_send_group_message: 'sendGroupLegacy',
+  qq_send_private_message: 'sendPrivateLegacy',
 };
 const disabledTools = [];
 {
@@ -797,6 +804,40 @@ if (cfg.socialV2?.tools?.sendPoke !== false) {
     }
   );
 }
+
+server.tool(
+  'qq_wake_peer',
+  '请求桥接唤醒另一个 QQ 会话，让那边的「你」用自己的令牌主动开口 —— 比如老板让你去陪某人聊天、或你想主动找某人说话时。**你不能跨会话直接发消息**（令牌只属于当前会话，跨发会被桥接拒绝），想找别人说话只能用这个工具请桥接唤醒对方会话，由那边的你亲自说。限制：目标必须在白名单内、每个目标每分钟最多 2 次、不能唤醒自己所在会话、被唤醒后对方可能选择潜水（由对方自己判断要不要说）。reserved2 下必须携带会话令牌 token。',
+  {
+    key: z.string().describe('当前会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    targetKey: z.string().describe('要唤醒的目标会话，格式 group:群号 或 private:QQ号'),
+    reason: z.string().optional().describe('唤醒原因（可选，写清楚为什么找对方，会出现在对方上下文的日志里）')
+  },
+  async ({ key, token, targetKey, reason }) => {
+    try {
+      if (!token || !String(token).trim()) {
+        return { content: [{ type: 'text', text: '唤醒失败：reserved2 下必须携带会话令牌 token' }], isError: true };
+      }
+      const target = String(targetKey ?? '').trim();
+      if (!/^(group|private):\d+$/.test(target)) {
+        return { content: [{ type: 'text', text: '唤醒失败：targetKey 格式应为 group:群号 或 private:QQ号' }], isError: true };
+      }
+      if (target === String(key ?? '').trim()) {
+        return { content: [{ type: 'text', text: '唤醒失败：targetKey 不能是当前会话（你已经在这里了，直接说话即可）' }], isError: true };
+      }
+      const data = await agentApi('/api/socialV2/wake', {
+        method: 'POST',
+        body: JSON.stringify({ key: target, reason: reason ? String(reason) : 'agent' }),
+        headers: { 'x-agent-token': token },
+        timeoutMs: 30000
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `唤醒失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
 
 server.tool(
   'qq_wait_for_messages',
