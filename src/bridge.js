@@ -2810,6 +2810,20 @@ async function main() {
       rememberAgentToken(key, st.agentToken);
       st.bootstrapSent = false;
       st.modelSeenSeqs = new Set();
+      // ── 退役必须把「想找你说话」的定时器还回来 ─────────────────────────────
+      //
+      // clearSocialV2Timers() 把 proactiveTimer / sleepTimer 一起清了，而
+      // scheduleProactiveCheckV2() 只在三处被调用：进程就绪、暂停恢复、模式进入。
+      // 于是这里不清不补 = 一次闲置回收之后**这个会话永远不会再主动说话**，
+      // 直到对方先开口才有下一次调度机会。
+      //
+      // 这个组合是自相矛盾的：主动找话的前提正是「安静够久」，而安静够久恰好触发回收。
+      // 实测后果（2026-10-28 20:58 回收后 → 次日 12:11 掉线）两个会话整夜零主动消息，
+      // 日志里连一条「已安排主动机会检查」都没有。
+      //
+      // 回收的是 DSH 会话（省上下文），不是「想说话」的意图，两者必须解耦。
+      setupSleepTimerV2(key);
+      scheduleProactiveCheckV2(key);
     }
     saveState();
     saveSocialV2State();
