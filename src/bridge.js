@@ -10419,8 +10419,19 @@ const adminOnlyV2Paths = ['/api/socialV2/config', '/api/socialV2/activity', '/ap
       const response = await fetch(url, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ query, max_tokens: Number(hs.maxTokens) || 400 }),
-        signal: AbortSignal.timeout(Number(hs.timeoutMs) || 4000),
+        // 候选池要**大**，最后注入的**少**。
+        //
+        // 为什么不能只取 3 条：Hindsight 的 reranker 对候选几乎全部给 0.999，
+        // 最终分差在 0.01 量级（实测 1.1272 / 1.1265 / 1.1192），排序接近随机；
+        // 语义分也很平（0.68–0.87）。实测 max_tokens=400 时，14:43「主动找妈妈
+        // 成功」那条**根本不在候选里**，注入的必然是 10-28 的旧记忆 —— 于是它
+        // 把昨天「等 token 修好再补发」的承诺当成还没做完，隔天还在问「妈妈那边
+        // 还差着吗」。要把它捞进池子，实测 400→MISS、8000→HIT，就在第 61 位。
+        //
+        // 所以：拉大候选池 → 本地按「新鲜度 + 相关性」自己挑，不再信它的排序。
+        // 实测耗时与预算基本无关（400≈3.1s，8000≈2.6s），成本主要是固定开销。
+        body: JSON.stringify({ query, max_tokens: Number(hs.candidateTokens) || 6000 }),
+        signal: AbortSignal.timeout(Number(hs.timeoutMs) || 6000),
       });
       if (!response.ok) { recallCache.set(key, { text: '', query, at: Date.now() }); return ''; }
       const body = await response.json();
@@ -10428,36 +10439,116 @@ const adminOnlyV2Paths = ['/api/socialV2/config', '/api/socialV2/activity', '/ap
       // 【会话令牌】【二代仿真模式说明】也抽成事实，实测召回前 3 条里 2 条是这种垃圾，
       // 其中一条还带明文令牌。这类条目既没用又危险，注入前一律剔除。
       const MEMORY_NOISE = /会话令牌|状态令牌|调用二代|状态工具|\btoken\b|ownerQQ|二代仿真模式|文本输出不会自动发送|所有发言都必须|系统提示|system prompt|[0-9a-f]{32,}/i;
+      // 第二类噪声：**记账式记忆**。它们既不是「这个人是谁」，也不是「发生过什么值得记的事」，
+      // 而是每次唤醒都会写一条的操作流水：已读水位、未读条数、等了几秒没回复、
+      // 潜水/唤醒配置、seq 号、被判成「旧账」…… 数量极大，且几乎条条命中当前对话对象的
+      // QQ 号，所以在「提到当前对象优先」的排序下永远霸占前几位，把真正的内容挤没。
+      // 实测（2026-10-29）：不过滤时前 3 条全是这种流水，过滤后才有「妈妈在备 React 面试」这类内容。
+      const MEMORY_BOOKKEEPING = /readThroughSeq|已读水位|未读 *\d+ *条|会话状态：截至|等满 *\d+ *分钟|等 *\d+ *秒无人回复|潜水|唤醒配置|概率 *0?\.\d|mode=diving|seq *\d+|主动冒泡|旧账|throughSeq/i;
+      // 第三类：身份样板。第一次知道有用，之后每次召回都占位就是纯浪费（且挤掉新闻）。
+      const MEMORY_BOILERPLATE = /昵称是|群名片可能与昵称不同|称呼助手为|身份是管理员|需要通过 SnowLuma 网关发送消息的联系人|主要用于私聊与机器人交互|指该智能体本人/;
       // 主语标注：记忆库是「大肥鱼」自己的（不分库），但每条要标清讲的是谁，
       // 当前对话对象排前面 —— 这样它不会把别人的事当成眼前这个人的上下文。
       const currentId = String(key).replace(/^(private|group):/, '');
       // 顺手删除：召回是唯一能「看到具体是哪条记忆」的时机，所以噪声条目在这里删掉，
       // 而不是靠定时器全量扫。Hindsight 的 retain 没有入库前钩子（env 与插件配置都没有
       // 内容过滤项，只能整体开关），所以「写后清理」是唯一可行的位置。
+      // 只删第一类（令牌/模式说明，含泄漏风险）；记账与样板类**不删**，只是不注入。
+      //
+      // ⚠️ 2026-10-29 实测：Hindsight 0.8.x 的 `DELETE /memories/{id}` 返回 405，
+      // 只支持 `DELETE /memories?type=...`（按类型整批删，太粗）和 PATCH 改文本。
+      // 也就是说下面这段「写后清理」目前**一直是空转**（异常被 catch 吞掉）。
+      // 保留是因为它无害且未来版本可能支持；不要以为它真的在清理——
+      // 真正起作用的是上面的读侧过滤。
       const purged = [];
-      const scored = (Array.isArray(body?.results) ? body.results : [])
-        .map((r) => {
-          const text = String(r?.text || '').trim();
-          if (text.length < 8 || MEMORY_NOISE.test(text)) {
-            if (r?.id && MEMORY_NOISE.test(text)) purged.push(String(r.id));
-            return null;
+      const nowMs = Date.now();
+      const ageHoursOf = (r) => {
+        const raw = r?.mentioned_at ?? r?.occurred_end ?? r?.occurred_start;
+        if (!raw) return null;
+        const t = Date.parse(String(raw));
+        if (!Number.isFinite(t)) return null;
+        return Math.max(0, (nowMs - t) / 3_600_000);
+      };
+      const ageLabel = (h) => (h == null ? '时间不详'
+        : h < 1 ? `${Math.max(1, Math.round(h * 60))}分钟前`
+          : h < 36 ? `${Math.round(h)}小时前`
+            : `${Math.round(h / 24)}天前`);
+      const shape = (r, idOverride) => {
+        const text = String(r?.text || '').trim();
+        if (text.length < 8) return null;
+        if (MEMORY_NOISE.test(text)) {
+          if (r?.id) purged.push(String(r.id));
+          return null;
+        }
+        if (MEMORY_BOOKKEEPING.test(text) || MEMORY_BOILERPLATE.test(text)) return null;
+        const ids = [...new Set((text.match(/\d{6,12}/g) || []))];
+        const otherId = ids.find((id) => id !== currentId);
+        const tag = ids.includes(currentId)
+          ? (friendLabelOf(currentId) || '当前对话对象')
+          : (otherId ? (friendLabelOf(otherId) || `QQ ${otherId}`) : '');
+        const ageH = ageHoursOf(r);
+        const semantic = Number(r?.scores?.semantic);
+        return {
+          id: idOverride ?? (r?.id ? String(r.id) : text.slice(0, 40)),
+          text, tag, ageH,
+          rank: ids.includes(currentId) ? 0 : (ids.length ? 1 : 2),
+          // 相关性用它的语义分，但**必须叠时效**：分数区间太窄（0.68–0.87），
+          // 单靠它挑不出「今天刚发生」和「三天前」的差别。
+          rel: (Number.isFinite(semantic) ? semantic : 0.5) + 0.35 * (ageH == null ? 0 : Math.exp(-ageH / 24)),
+        };
+      };
+      // 相关性候选：recall 那一批（它擅长「语义像」，但排序基本是随机，见上文）。
+      const candidates = (Array.isArray(body?.results) ? body.results : []).map((r) => shape(r)).filter(Boolean);
+      // 时效候选：**必须另走 list**，不能指望 recall。
+      //
+      // 实测（2026-10-29）：14:43「助手主动找妈妈、妈妈回了『等我有空，你去找爸爸玩』」
+      // 这条在 recall 的 8000 预算 82 条里排第 61 位，任何合理预算都捞不出来；
+      // 而换成 list 全库（192 条）按 mentioned_at 倒序，它直接排到第 2、第 4 位。
+      // 差别在于 recall 的 reranker 给所有候选几乎同一个分（0.999），
+      // 排序等于没排；list 的时间戳是真实数据，能直接排。
+      const freshCandidates = [];
+      try {
+        const listUrl = `${url.replace(/\/memories\/recall$/, '')}/memories/list?limit=200&offset=0`;
+        const listRes = await fetch(listUrl, { signal: AbortSignal.timeout(Number(hs.timeoutMs) || 6000) });
+        if (listRes.ok) {
+          const listBody = await listRes.json();
+          for (const m of (Array.isArray(listBody?.items) ? listBody.items : [])) {
+            const item = shape(m, m?.id ? `list:${m.id}` : undefined);
+            if (item) freshCandidates.push(item);
           }
-          const ids = [...new Set((text.match(/\d{6,12}/g) || []))];
-          const otherId = ids.find((id) => id !== currentId);
-          const tag = ids.includes(currentId)
-            ? (friendLabelOf(currentId) || '当前对话对象')
-            : (otherId ? (friendLabelOf(otherId) || `QQ ${otherId}`) : '');
-          return { text, tag, rank: ids.includes(currentId) ? 0 : (ids.length ? 1 : 2) };
-        })
-        .filter(Boolean)
-        .sort((a, b2) => a.rank - b2.rank)
-        .slice(0, Number(hs.maxItems) || 3);
+        }
+      } catch { /* list 拿不到就只用 recall，退化成旧行为，不阻塞唤醒 */ }
+      const limit = Number(hs.maxItems) || 4;
+      const byFresh = [...freshCandidates].sort((a, b2) => (a.ageH ?? 1e9) - (b2.ageH ?? 1e9));
+      const byRelevant = [...candidates].sort((a, b2) => (a.rank - b2.rank) || (b2.rel - a.rel));
+      const picked2 = [];
+      const seen = new Set();
+      const take = (item) => {
+        if (!item || seen.has(item.id) || picked2.length >= limit) return;
+        // 同一条内容可能在 recall 与 list 里各有一份（id 前缀不同），按正文去重。
+        const key = item.text.slice(0, 60);
+        if ([...seen].some((s) => s === key)) return;
+        seen.add(item.id); seen.add(key); picked2.push(item);
+      };
+      // 先放「最新发生了什么」——它回答的是「你昨天那件事做完了吗」这类问题；
+      // 再放「跟眼前这个人最相关的」——避免答非所问。
+      take(byFresh[0]);
+      take(byFresh[1]);
+      for (const item of byRelevant) take(item);
+      for (const item of byFresh) take(item);
+      const scored = picked2;
       // 正则只能判断「提到过某人」，判断不了「这条的主语是谁」（"管理员把 B 的号托付给我"
       // 这条讲的是管理员，但文本里有 B 的号）。所以除了前缀标签，再给一句全局提示，
       // 让模型自己按原文主语判断 —— 宁可多说一句，也不要它把别人的事当成眼前这个人的。
       const text = scored.length === 0 ? '' : [
         `（当前对话对象：${friendLabelOf(currentId) ? `${friendLabelOf(currentId)}（${key}）` : key}。以下都是「你」记得的事，但主体不一定是你眼前这个人，按原文主语区分。）`,
-        ...scored.map((item) => `- ${item.tag ? `[${item.tag}] ` : ''}${item.text.length > 220 ? `${item.text.slice(0, 220)}…` : item.text}`),
+        '（每条前面标了这件事发生/记下的时间，越旧越可能过时。判断时按这三条来：'
+        + '①「计划 / 承诺 / 待办 / 仍在等待 / 未获授权」**不等于做完了**，只有写明「已发送 / 已完成 / 对方回复了」才算；'
+        + '②同一件事有新旧两条时以新的为准，别拿旧承诺当待办去追问对方；'
+        + '③拿不准就先调工具查现状（未读、最近消息），不要凭印象断言「还欠着」。'
+        + '实测过的翻车：它 14:43 已经把话带到、对方也回了，14:54 却因为翻到前一天「等 token 修好再补发」的记忆，'
+        + '又去问对方「妈妈那边还差着吗」。）',
+        ...scored.map((item) => `- [${ageLabel(item.ageH)}]${item.tag ? `[${item.tag}] ` : ''}${item.text.length > 220 ? `${item.text.slice(0, 220)}…` : item.text}`),
       ].join('\n');
       recallCache.set(key, { text, query, at: Date.now() });
       if (purged.length) {
