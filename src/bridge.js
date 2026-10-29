@@ -10621,16 +10621,25 @@ const adminOnlyV2Paths = ['/api/socialV2/config', '/api/socialV2/activity', '/ap
         ...scored.map((item) => `- [${ageLabel(item.ageH)}]${item.tag ? `[${item.tag}] ` : ''}${item.text.length > 220 ? `${item.text.slice(0, 220)}…` : item.text}`),
       ].join('\n');
       recallCache.set(key, { text, query, at: Date.now() });
+      // 排查用：hindsight.debug=true 时把最终注入的内容打出来。
+      // 记忆这块「猜不出来只能看」——注入的是哪几条、标了什么时间，必须能直接读。
+      if (hs.debug === true) log(`[memory:debug] ${key}\n${text}`);
       if (purged.length) {
         void (async () => {
+          let removed = 0;
           for (const id of purged) {
             try {
-              await fetch(`${url.replace(/\/memories\/recall$/, '')}/memories/${encodeURIComponent(id)}`, {
+              const res = await fetch(`${url.replace(/\/memories\/recall$/, '')}/memories/${encodeURIComponent(id)}`, {
                 method: 'DELETE', signal: AbortSignal.timeout(4000),
               });
+              if (res.ok) removed++;
             } catch { /* 删不掉就算了，下次召回还会再试 */ }
           }
-          log(`[memory] 顺手清掉 ${purged.length} 条噪声记忆（令牌/模式说明）`);
+          // 别报喜不报忧：实测 Hindsight 0.8.x 的 DELETE /memories/{id} 是 405，
+          // 所以这里大概率 removed=0。真正起作用的永远是上面的读侧过滤。
+          log(removed > 0
+            ? `[memory] 噪声记忆：尝试 ${purged.length} 条，实际删除 ${removed} 条`
+            : `[memory] 噪声记忆：本次拦下 ${purged.length} 条（Hindsight 无单条删除接口，只有读侧过滤生效）`);
         })();
       }
       return text;
