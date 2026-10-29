@@ -5394,6 +5394,9 @@ const adminOnlyV2Paths = ['/api/socialV2/config', '/api/socialV2/activity', '/ap
             st.wakeConfig.noActionCount = 0;
             saveSocialV2State();
             log(`[reserved2] 工具统一发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
+            // 写侧纠偏：只有在**真的投递成功**时才写「已完成」，
+            // 失败路径（下面的 catch）不写 —— 失败本身就是还没做成，不能造假。
+            if (sentMessages.length > 0) void ingestSendCorrection(key, messages.slice(0, sentMessages.length));
             appendActivity(`${key} [reserved2] 工具统一发送：成功 ${sentMessages.length}/${messages.length} 条`);
             if (sentMessages.length > 0) scheduleReplyCheckV2(key);
             const burstHint = messages.length >= 3 ? '你已经连发了多条，确认是必要的吗？真人很少一口气补完。' : undefined;
@@ -10400,6 +10403,53 @@ const adminOnlyV2Paths = ['/api/socialV2/config', '/api/socialV2/activity', '/ap
   }
 
   const recallCache = new Map(); // key -> { text, query, at }
+  // ── 写侧纠偏：动作真成功时，立刻写一条带新时间戳的「已完成」 ──────────────
+  //
+  // 为什么必须有这一步（这是一个实测过的翻车）：
+  //   14:43 它主动找妈妈聊天，工具返回「成功 2/2 条」；14:44 妈妈还回了话。
+  //   14:54 它却写下一条记忆「妈妈那条问候仍在等待授权放行」并入库。
+  //   之后每次召回都拿这条当证据，越问越确信，隔天还在问「妈妈那边还差着吗」。
+  //
+  // 读侧过滤只能「少挑几条」，改不了「库里存在一条更晚的错误断言」这个事实 ——
+  // 那条错误记忆的时间戳比真相还新，任何按时间排序都会把它排前面。
+  // 唯一能从根上压住它的办法：在动作真的成功那一刻，写一条**时间更新**的「已完成」。
+  //
+  // 用 retain（POST /memories, async=true）而不是裸插入：Hindsight 没有裸插接口，
+  // 只有 retain（走抽取 LLM）和 document 导入。async 让它后台跑，不阻塞发送路径；
+  // 抽取代价很小（一条短文本），而写不进去的后果是隔天继续翻旧账。
+  const sendCorrectionAt = new Map();
+  async function ingestSendCorrection(key, texts) {
+    try {
+      const hs = cfg.socialV2?.hindsight ?? {};
+      if (hs.enabled === false) return;
+      if (!Array.isArray(texts) || texts.length === 0) return;
+      // 节流：同一会话 90 秒内只写一条，避免连发多条刷出一堆纠偏记忆（那又是噪声）。
+      const nowC = Date.now();
+      if (nowC - Number(sendCorrectionAt.get(key) ?? 0) < 90_000) return;
+      sendCorrectionAt.set(key, nowC);
+      const m = /^(private|group):(\d+)$/.exec(String(key));
+      if (!m) return;
+      const label = friendLabelOf(m[2]) || (m[1] === 'group' ? `群 ${m[2]}` : `QQ ${m[2]}`);
+      const snippet = texts.map((t) => String(t).replace(/\s+/g, ' ').trim()).join(' / ').slice(0, 220);
+      const stamp = new Date().toISOString();
+      const hhmm = new Date().toLocaleString('zh-CN', { hour12: false }).replace(/\//g, '-');
+      const content = `Correction: ${hhmm}，助手已通过工具**成功发送**并确认投递 ${texts.length} 条消息给${label}（${key}）：「${snippet}」。`
+        + `这件事到这里就算做完了 —— 之前任何「还欠着 / 待补发 / 仍在等待放行 / 等以后再说」的记录全部作废，不要再用它当待办去追问对方。`;
+      const bankId = String(hs.bankId || 'coding-agent::qq-workspace');
+      const url = `http://127.0.0.1:${Number(hs.port) || 9077}/v1/default/banks/${encodeURIComponent(bankId)}/memories`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ items: [{ content, timestamp: stamp, tags: ['correction', 'send-confirmed'] }], async: true }),
+        signal: AbortSignal.timeout(Number(hs.timeoutMs) || 6000),
+      });
+      if (!res.ok) { log(`[memory] 纠偏写入失败 ${key}: HTTP ${res.status}`); return; }
+      log(`[memory] 已写入纠偏记忆 ${key}（${texts.length} 条已确认发送）`);
+    } catch (error) {
+      log(`[memory] 纠偏写入异常 ${key}: ${error?.message ?? error}`);
+    }
+  }
+
   async function recallPeerMemory(key, reason) {
     const hs = cfg.socialV2?.hindsight ?? {};
     if (hs.enabled === false) return '';
@@ -10446,7 +10496,7 @@ const adminOnlyV2Paths = ['/api/socialV2/config', '/api/socialV2/activity', '/ap
       // 实测（2026-10-29）：不过滤时前 3 条全是这种流水，过滤后才有「妈妈在备 React 面试」这类内容。
       const MEMORY_BOOKKEEPING = /readThroughSeq|已读水位|未读 *\d+ *条|会话状态：截至|等满 *\d+ *分钟|等 *\d+ *秒无人回复|潜水|唤醒配置|概率 *0?\.\d|mode=diving|seq *\d+|主动冒泡|旧账|throughSeq/i;
       // 第三类：身份样板。第一次知道有用，之后每次召回都占位就是纯浪费（且挤掉新闻）。
-      const MEMORY_BOILERPLATE = /昵称是|群名片可能与昵称不同|称呼助手为|身份是管理员|需要通过 SnowLuma 网关发送消息的联系人|主要用于私聊与机器人交互|指该智能体本人/;
+      const MEMORY_BOILERPLATE = /昵称是|群名片可能与昵称不同|称呼助手为|身份是管理员|需要通过 SnowLuma 网关发送消息的联系人|主要用于私聊与机器人交互|指该智能体本人|会话标识为|机器人账号的管理员|owner）是|就是「爸爸」/;
       // 主语标注：记忆库是「大肥鱼」自己的（不分库），但每条要标清讲的是谁，
       // 当前对话对象排前面 —— 这样它不会把别人的事当成眼前这个人的上下文。
       const currentId = String(key).replace(/^(private|group):/, '');
@@ -10521,19 +10571,39 @@ const adminOnlyV2Paths = ['/api/socialV2/config', '/api/socialV2/activity', '/ap
       const limit = Number(hs.maxItems) || 4;
       const byFresh = [...freshCandidates].sort((a, b2) => (a.ageH ?? 1e9) - (b2.ageH ?? 1e9));
       const byRelevant = [...candidates].sort((a, b2) => (a.rank - b2.rank) || (b2.rel - a.rel));
+      // 近似去重：Hindsight 的 retain 会把一条内容抽成 3–4 条几乎一样的记忆
+      // （实测一次「已发送确认」抽出 4 条，措辞不同、时间戳完全相同）。
+      // 只按 id 去重挡不住它们，结果两条名额全被同一个意思占掉，真正的新内容挤不进来。
+      // 所以再按字符二元组的重合度做一遍近似判断。
+      const bigrams = (t) => {
+        const s2 = String(t).replace(/[\s\p{P}]/gu, '');
+        const out = new Set();
+        for (let i = 0; i < s2.length - 1; i++) out.add(s2.slice(i, i + 2));
+        return out;
+      };
+      const tooSimilar = (a, b2) => {
+        if (a.length < 8 || b2.length < 8) return a === b2;
+        const A = bigrams(a); const B2 = bigrams(b2);
+        if (A.size === 0 || B2.size === 0) return false;
+        let inter = 0;
+        for (const g of A) if (B2.has(g)) inter++;
+        return inter / Math.min(A.size, B2.size) >= 0.55;
+      };
       const picked2 = [];
       const seen = new Set();
       const take = (item) => {
         if (!item || seen.has(item.id) || picked2.length >= limit) return;
-        // 同一条内容可能在 recall 与 list 里各有一份（id 前缀不同），按正文去重。
-        const key = item.text.slice(0, 60);
-        if ([...seen].some((s) => s === key)) return;
-        seen.add(item.id); seen.add(key); picked2.push(item);
+        if (picked2.some((p) => tooSimilar(p.text, item.text))) return;
+        seen.add(item.id); picked2.push(item);
       };
-      // 先放「最新发生了什么」——它回答的是「你昨天那件事做完了吗」这类问题；
-      // 再放「跟眼前这个人最相关的」——避免答非所问。
+      // 名额分配（这是「问『你给妈妈聊了啥』却答不上来」的关键）：
+      //   ① 最新一条 —— 回答「你昨天那事做完了吗」
+      //   ② 最新一条**提到别人**的 —— 回答「你最近跟某人怎么样」。只在提到当前对象的
+      //      记忆里找，永远找不到「跟别人发生了什么」，而这恰恰是老板最常问的。
+      //   ③④ 跟眼前这个人最相关的 —— 避免答非所问。
       take(byFresh[0]);
-      take(byFresh[1]);
+      const crossPeer = byFresh.find((i) => /\d{6,12}/.test(i.text) && !new RegExp(currentId).test(i.text));
+      take(crossPeer);
       for (const item of byRelevant) take(item);
       for (const item of byFresh) take(item);
       const scored = picked2;
