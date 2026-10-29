@@ -2351,7 +2351,7 @@ async function main() {
   }
 
   if (!cfg.allow.private.length && !cfg.allow.groups.length && cfg.allowAllWhenEmpty) {
-    log('⚠️  白名单为空且 allowAllWhenEmpty=true：将转发所有私聊/群聊消息给 agent');
+    log(`⚠️  白名单为空且 allowAllWhenEmpty=true：将转发所有私聊/群聊消息给 agent（配置来自 ${path.join(ROOT, 'config.json')}，allow=${JSON.stringify(cfg.allow ?? null)}）`);
   } else if (!cfg.allow.private.length && !cfg.allow.groups.length) {
     // 否则这是一个「静默无响应」陷阱：消息全被丢弃，用户只看到 QQ 上毫无反应。
     log(`⚠️  白名单为空且 allowAllWhenEmpty=false：不会响应任何 QQ 消息。请在 config.json 填 allow.private / allow.groups，或在控制台 http://127.0.0.1:${cfg.consolePort} 填写白名单`);

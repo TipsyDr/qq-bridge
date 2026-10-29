@@ -32,6 +32,32 @@ if [ "${1:-}" = "--once" ]; then
   exec node src/bridge.js
 fi
 
+# ── 单一守护锁 ──────────────────────────────────────────────────────────────
+#
+# 为什么需要：launchd 的 KeepAlive 和本脚本的 while 循环是两个监管者。
+# 实测 2026-10-29 14:33:52 / 14:34:30 日志里出现过多份「桥接已启动」，
+# 13:09 也见过两个 node 进程并存 5 秒。重复实例的后果不是"多跑一个"这么简单：
+#   · 各自轮换 agentToken → 在途回合的 MCP 发送全部 403
+#   · 各自调度 proactive → 同一个人被连戳两次
+#   · 各自消费同一条 QQ 事件 → 同一条消息被回两遍
+# bridge.js 自己有 state/*.lock，但它按「控制台端口是否被占」判活；
+# 端口还没绑上的那几百毫秒里两个实例都会认为自己是第一个。
+# 所以在这里用 mkdir 原子锁再兜一层：拿不到锁就安静退出（exit 0），
+# 让 launchd 认为这次启动"正常"，不会变成重启风暴。
+LOCKDIR="state/.start.lock"
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  holder=$(cat "$LOCKDIR/pid" 2>/dev/null || echo '?')
+  if [ "$holder" != '?' ] && kill -0 "$holder" 2>/dev/null; then
+    echo "[$(date '+%F %T')] 已有守护进程在跑（PID ${holder}），本实例退出。"
+    exit 0
+  fi
+  echo "[$(date '+%F %T')] 清理过期锁（PID $holder 已不存在）"
+  rm -rf "$LOCKDIR"
+  mkdir "$LOCKDIR" 2>/dev/null || { echo "拿不到锁，退出。"; exit 0; }
+fi
+echo $$ > "$LOCKDIR/pid"
+trap 'rm -rf "$LOCKDIR"' EXIT INT TERM
+
 while :; do
   node src/bridge.js
   code=$?

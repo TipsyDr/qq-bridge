@@ -38,7 +38,7 @@ DSH 重启后**不用手动做任何事**（watcher 会把桥拉过去）。
 {
   "sessionCwd": "~/.dsh/qq-workspace",     // 让 Hindsight bank 与代码仓库隔离
   "allow": { "private": [OWNER_QQ, PEER_QQ], "groups": [] },
-  "allowAllWhenEmpty": true,
+  "allowAllWhenEmpty": false,                 // fail-closed：白名单没准备好就不转发（2026-10-29 从 true 改来）
   "ownerQQ": [OWNER_QQ],
   "ackMessage": "🤔 收到，正在思考…",       // 发消息后先给个回执
 
