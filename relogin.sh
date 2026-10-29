@@ -37,7 +37,20 @@ UID_NUM="$(id -u)"
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 
 # ── 1. 先摘桥接：只是为了别在没登录时刷一堆重连错误日志 ────────────────
+BRIDGE_BOOTED_OUT=""
+restore_bridge() {
+  # 被打断（Ctrl+C / kill）时也把桥接放回去：否则 launchd 里没有这个 job，
+  # 桥接会一直停着，而且日志里什么都不会说 —— 实测踩过一次。
+  if [ "${BRIDGE_BOOTED_OUT}" = "1" ] && ! pgrep -f "node src/bridge.js" >/dev/null; then
+    launchctl bootstrap "gui/${UID_NUM}" "$HOME/Library/LaunchAgents/${LABEL}.plist" 2>/dev/null \
+      || launchctl kickstart "gui/${UID_NUM}/${LABEL}" 2>/dev/null || true
+    echo "  （退出前已把桥接重新挂上）"
+  fi
+}
+trap restore_bridge EXIT INT TERM
+
 say "1/5 停掉桥接（避免它在未登录时刷重连错误）"
+BRIDGE_BOOTED_OUT="1"
 launchctl bootout "gui/${UID_NUM}/${LABEL}" 2>/dev/null || true
 for _ in $(seq 1 15); do pgrep -f "node src/bridge.js" >/dev/null || break; sleep 1; done
 pgrep -f "node src/bridge.js" >/dev/null && { pkill -f "node src/bridge.js"; sleep 2; }
@@ -74,11 +87,25 @@ fi
 
 # ── 4. 等登录成功 ──────────────────────────────────────────────────────
 say "4/5 等待扫码 + 登录成功（最多 5 分钟）"
+ONEBOT_TOKEN=$(python3 -c "
+import json,glob,sys
+fs=glob.glob('$HOME/qq-bridge-napcat/config/onebot11_*.json')
+for f in fs:
+    try:
+        d=json.load(open(f,encoding='utf-8'))
+        s=(d.get('network') or {}).get('httpServers') or []
+        if s and s[0].get('token'): print(s[0]['token']); break
+    except Exception: pass
+" 2>/dev/null)
 online=""
 for i in $(seq 1 100); do
-  if docker logs --since 6m napcat 2>&1 | grep -aq "账号状态变更为在线"; then online=1; break; fi
-  if docker logs --since 6m napcat 2>&1 | grep -aq "KickedOffLine"; then
-    echo "  ⚠️ 刚登上去又被踢了 —— 这个号的风控已经很紧，见下面建议" >&2
+  # 以 OneBot 自报状态为准：快速登录路径不会打「账号状态变更为在线」那行日志，
+  # 早先只看日志会一直等下去（实测 17:1x 那次就是这样卡住，最后服务被 bootout 了却没恢复）。
+  st=$(curl -s -m 4 -X POST http://127.0.0.1:3000/get_status \
+        -H "Authorization: Bearer ${ONEBOT_TOKEN}" -H 'Content-Type: application/json' -d '{}' 2>/dev/null)
+  case "$st" in *'"online":true'*) online=1; break;; esac
+  if docker logs --since 3m napcat 2>&1 | grep -aq "KickedOffLine"; then
+    echo "  ⚠️ 刚登上去又被踢了 —— 这个号的风控已经很紧" >&2
   fi
   sleep 3
 done
