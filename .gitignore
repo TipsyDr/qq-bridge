@@ -67,3 +67,6 @@ docs/guides/VOICE.md
 audio/
 
 qrcode.png
+
+# 运行时产物：存活计时器与状态，不入库
+logs/
