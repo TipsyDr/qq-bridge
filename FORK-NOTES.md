@@ -31,9 +31,14 @@ macOS **没有** SnowLuma 构建（截至 v2.2.1，官方只发 Windows x64 / Li
 > 2026-10-30 更正：fork 时（v1.x 时代）上游只有 `native/snowluma-win32-x64.{dll,node}`，
 > 所以当时记的是「只好 Windows」。现在上游已提供 **Linux arm64** 发行包，理论上是能在
 > Apple Silicon 的 Docker 里跑的 —— 难点不在平台，而在雪上加霜的两件事：
-> ① SnowLuma 不提供 Docker 镜像，得自己把 Linux QQ 装进容器并配 hook；
 > ② 桥接钉的 `@snowluma/sdk` 是 1.14.20，而 npm 上已是 **2.2.1**，跨大版本要改代码 + 回归。
-> 结论（继续用 NapCat）不变，但原因从「跑不了」改成「能跑但不划算」。
+>
+> 2026-10-30 再更正（上面那条也是错的）：SnowLuma **有**官方 Docker 镜像
+> `motricseven7/snowluma:latest`（multi-arch，含 linux/arm64），镜像内自带 Linux QQ +
+> 虚拟桌面 + noVNC，不需要自己拼。官方 quickstart 明确推荐「Docker on Linux」为最省事路径。
+> 已在 Apple Silicon 上实测拉起：WebUI 5099、noVNC 6081、OneBot 3000/3001，
+> 容器内 qq 进程 6 个，无报错。**「macOS 跑不了 SnowLuma」这个结论到此作废**，
+> 剩下的唯一问题是值不值得换（见下）。
 改用 NapCat 官方 Docker 镜像 `mlikiowa/napcat-docker`（134.9 万次拉取，2026-10-26 更新）：
 
 ```bash
