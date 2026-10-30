@@ -26,7 +26,14 @@
 
 ### 1. QQ 侧换成 NapCat（macOS 用 Docker）
 
-macOS 无法跑 SnowLuma（原生组件只有 `native/snowluma-win32-x64.{dll,node}`）。
+macOS **没有** SnowLuma 构建（截至 v2.2.1，官方只发 Windows x64 / Linux x64 / Linux arm64）。
+
+> 2026-10-30 更正：fork 时（v1.x 时代）上游只有 `native/snowluma-win32-x64.{dll,node}`，
+> 所以当时记的是「只好 Windows」。现在上游已提供 **Linux arm64** 发行包，理论上是能在
+> Apple Silicon 的 Docker 里跑的 —— 难点不在平台，而在雪上加霜的两件事：
+> ① SnowLuma 不提供 Docker 镜像，得自己把 Linux QQ 装进容器并配 hook；
+> ② 桥接钉的 `@snowluma/sdk` 是 1.14.20，而 npm 上已是 **2.2.1**，跨大版本要改代码 + 回归。
+> 结论（继续用 NapCat）不变，但原因从「跑不了」改成「能跑但不划算」。
 改用 NapCat 官方 Docker 镜像 `mlikiowa/napcat-docker`（134.9 万次拉取，2026-10-26 更新）：
 
 ```bash
